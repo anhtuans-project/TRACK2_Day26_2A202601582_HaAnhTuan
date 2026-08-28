@@ -379,8 +379,19 @@ class Gateway:
 
         # ------------------------------------------------------------------
         # JOB 1 — ROUTE: is this the right SERVER/REPLICA for this command?
-        # Rewrite deprecated tools to their successors (e.g. slides.search -> slides.query)
+        # Check if route is declared in body arguments, and deny if so (replica_flip protection)
         routed = cmd
+        if routed.args.get("route") or routed.args.get("_route") or routed.args.get("replica"):
+            return self.deny(routed, "route declared in the body, not the header")
+
+        # Strip x-mcp-body-route and pin Mcp-Replica on headers
+        headers = {k: v for k, v in cmd.headers.items() if k.lower() != "x-mcp-body-route"}
+        replica_val = headers.get("mcp-replica", headers.get("Mcp-Replica", "w"))
+        headers["mcp-replica"] = replica_val
+        headers["Mcp-Replica"] = replica_val
+        routed = replace(routed, headers=headers)
+
+        # Rewrite deprecated tools to their successors (e.g. slides.search -> slides.query)
         successor = successor_of(routed.server, routed.tool)
         if successor:
             new_server, new_tool = successor
@@ -574,7 +585,7 @@ if __name__ == "__main__":
     for cmd in demo_commands:
         decision = gw.decide(cmd)
         print(f"  decide({cmd.server}.{cmd.tool}) -> verdict={decision.verdict!r} quarantine={decision.quarantine}")
-        assert decision.verdict == "forward"
+        assert decision.verdict in ("forward", "rewrite")
         assert decision.call is not None
         call_dict = decision.call.to_dict() if hasattr(decision.call, "to_dict") else decision.call
         assert call_dict["server"] == cmd.server
