@@ -103,6 +103,13 @@ except ImportError:  # pragma: no cover - collaborator file
     ToolCall = Any  # type: ignore[assignment, misc]
     _TOOLCALL_AVAILABLE = False
 
+try:
+    from kit.mcp.specs import TOOL_SPECS
+    _SPECS_AVAILABLE = True
+except ImportError:
+    TOOL_SPECS = {}
+    _SPECS_AVAILABLE = False
+
 # kit.loop.agent is also a collaborator's file, used only by this module's
 # own __main__ demo (to build real Commands the same way the arena's trusted
 # canonicaliser would) — never by decide() itself, which never touches the
@@ -351,6 +358,8 @@ class Gateway:
         # Command ids you have already denied, in case a later job wants to
         # know "have I already said no to this once".
         self._denied_cmd_ids: set[str] = set()
+        self._etags: dict[str, str] = {}
+        self._idempotency: set[str] = set()
 
     def decide(self, cmd: Command) -> Decision:
         """SYNCHRONOUS. PURE. NO I/O. 250 ms wall (RULES.md section 3).
@@ -380,7 +389,34 @@ class Gateway:
         # ------------------------------------------------------------------
         # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
         # it costs anything?
-        # starter: admits every command unconditionally.
+        if routed.tool == "get_frame" and routed.lease_id not in self.ctx.leases:
+            return self.deny(routed, "get_frame without a live lease")
+
+        is_write = False
+        if _SPECS_AVAILABLE and (routed.server, routed.tool) in TOOL_SPECS:
+            is_write = TOOL_SPECS[(routed.server, routed.tool)].is_write
+        else:
+            is_write = (routed.server, routed.tool) in {
+                ("content", "flag_stale_slide"),
+                ("content", "file_content_bug"),
+                ("progress", "record_mastery"),
+            }
+
+        if is_write:
+            anchor = str(routed.args.get("anchor", ""))
+            etag = self._etags.get(anchor)
+            if not etag:
+                return self.deny(routed, "write without a fresh If-Match etag")
+            
+            key = f"{anchor}:{routed.tool}"
+            if key in self._idempotency:
+                return self.deny(routed, "write already committed this duel")
+            
+            self._idempotency.add(key)
+            new_headers = dict(routed.headers)
+            new_headers["if-match"] = etag
+            new_headers["idempotency-key"] = key
+            routed = replace(routed, headers=new_headers)
 
         # ------------------------------------------------------------------
         # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
@@ -424,6 +460,11 @@ class Gateway:
         decision = Decision(verdict="deny", reason=reason)
         self._telemetry.decision_made(cmd, decision)
         return decision
+
+    def note_provenance(self, anchor: str, etag: str) -> None:
+        """Called by the arena/loop loop after a provenance read completes
+        so the gateway has a fresh etag to authorize future writes to the same anchor."""
+        self._etags[anchor] = etag
 
     def _to_tool_call(self, cmd: Command) -> "ToolCall":
         """`Command` -> the `ToolCall` (CONTRACTS.md 3.1) the arena will
