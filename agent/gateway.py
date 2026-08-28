@@ -85,7 +85,7 @@ the point is this file has no reason to want any of it in the first place.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 # kit.mcp.types is a collaborator's file (workspace hard rule 2: import it,
@@ -113,6 +113,7 @@ except ImportError:  # pragma: no cover - collaborator file
     _canonicalise_action = None
 
 from agent.telemetry import RecordingGatewayContext, Telemetry
+from agent.strategy import cheap_mask, is_catalog_trap, successor_of
 
 __all__ = [
     "COMMAND_KINDS",
@@ -369,25 +370,16 @@ class Gateway:
 
         # ------------------------------------------------------------------
         # JOB 1 — ROUTE: is this the right SERVER/REPLICA for this command?
-        # TODO(you): day18-style drift is real and measured (CORPUS-FACTS.md
-        # section 2) — a `swap_replica` mutation (CONTRACTS.md section 8's
-        # closed mutation-op set) can point `cmd` at a stale replica without
-        # the model ever noticing. `agent/strategy.py`'s replica-choice
-        # helper is where this heuristic belongs; wire its answer in here by
-        # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
-        # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+        # Rewrite deprecated tools to their successors (e.g. slides.search -> slides.query)
+        routed = cmd
+        successor = successor_of(routed.server, routed.tool)
+        if successor:
+            new_server, new_tool = successor
+            routed = replace(routed, server=new_server, tool=new_tool)
 
         # ------------------------------------------------------------------
         # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
         # it costs anything?
-        # TODO(you): a call you already KNOW is doomed (no live lease in
-        # `self.ctx.leases` for a `get_frame`, a write with no realistic
-        # chance of a matching `If-Match`, a call that already 409'd once
-        # this duel and nothing has changed) is a candidate to DENY here —
-        # and remember, `verdict="deny"` costs the caller ZERO credits
-        # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
-        # this is it). A `deny` you can defend beats a `forward` you can't.
         # starter: admits every command unconditionally.
 
         # ------------------------------------------------------------------
@@ -404,24 +396,20 @@ class Gateway:
             if aud and aud != routed.server:
                 return self.deny(routed, f"delegation aud {aud!r} does not match the server called")
 
-
         # ------------------------------------------------------------------
         # JOB 4 — BUDGET: can the DUEL (all 10 rounds, not just this call)
         # actually afford `routed` as written?
-        # TODO(you): `fields=("*",)` on `registry.list_servers` or
-        # `glossary.list_terms` is a "punishment button" (FINAL-PLAN.md
-        # section 4.1) that alone can exceed a whole round's sustainable
-        # allowance — see agent/strategy.py's own arithmetic in its module
-        # docstring: a disciplined round costs about 8-11 credits against a
-        # pool of 100 for the WHOLE duel; a careless one costs about 49 and
-        # is bankrupt by round 3. When `self.ctx.credits` is getting thin,
-        # REWRITE `routed.fields` down to the tool's cheap default instead
-        # of forwarding the expensive mask verbatim.
-        # starter: never rewrites a mask and never paces spend — it trusts
-        # the model's own field mask exactly as written, every time.
+        if is_catalog_trap(routed.server, routed.tool, routed.fields):
+            routed = replace(
+                routed,
+                fields=cheap_mask(routed.server, routed.tool, ("name",))
+            )
 
         call = self._to_tool_call(routed)
-        decision = Decision(verdict="forward", call=call)
+        if routed != cmd:
+            decision = Decision(verdict="rewrite", call=call, note="rewritten to successor/safe mask")
+        else:
+            decision = Decision(verdict="forward", call=call)
         self._telemetry.decision_made(cmd, decision)
         return decision
 
